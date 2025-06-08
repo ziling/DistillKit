@@ -1,4 +1,5 @@
 import os
+import io
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -44,6 +45,9 @@ config = {
     },
     "model_config": {
         "use_flash_attention": True
+    },
+    "cache": {
+        "teacher_logits": None  # Path to LMDB file with cached teacher logits
     }
     # "spectrum": {
     #     "layers_to_unfreeze": "/workspace/spectrum/snr_results_Qwen-Qwen2-1.5B_unfrozenparameters_50percent.yaml" # You can pass a spectrum yaml file here to freeze layers identified by spectrum.
@@ -91,11 +95,31 @@ print("Preprocessing and tokenizing dataset...")
 original_columns = dataset.column_names
 dataset = dataset.map(sharegpt_format, remove_columns=original_columns)
 
-def tokenize_function(examples):
-    return student_tokenizer(examples["text"], truncation=True, max_length=config["tokenizer"]["max_length"], padding="max_length")
-
-tokenized_dataset = dataset.map(tokenize_function, batched=True, num_proc=8, remove_columns=["text"])
+def tokenize_function(examples, indices):
+    tokens = student_tokenizer(
+        examples["text"],
+        truncation=True,
+        max_length=config["tokenizer"]["max_length"],
+        padding="max_length",
+    )
+    tokens["id"] = indices
+    return tokens
+tokenized_dataset = dataset.map(
+    tokenize_function,
+    batched=True,
+    with_indices=True,
+    num_proc=8,
+    remove_columns=["text"],
+)
 tokenized_dataset = tokenized_dataset.train_test_split(test_size=0.1)
+
+# Optional teacher logits cache
+cache_env = None
+if config.get("cache", {}).get("teacher_logits"):
+    import lmdb
+    cache_env = lmdb.open(
+        config["cache"]["teacher_logits"], readonly=True, lock=False
+    )
 
 print("Dataset preparation complete. Loading models...")
 
@@ -135,17 +159,25 @@ def pad_logits(student_logits, teacher_logits):
 class LogitsTrainer(SFTTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         device = next(model.parameters()).device
+        sample_id = inputs.pop("id") if "id" in inputs else None
         inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
         self.teacher_model = self.teacher_model.to(device)
-        
+
         student_model = model.module if hasattr(model, 'module') else model
         teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
 
         student_outputs = student_model(**inputs)
-        with torch.no_grad():
-            teacher_outputs = teacher_model(**inputs)
+        if self.cache_env is not None and sample_id is not None:
+            import io, torch as _torch
+            with self.cache_env.begin() as txn:
+                buf = txn.get(str(sample_id.item() if hasattr(sample_id, 'item') else sample_id).encode())
+            teacher_logits = _torch.load(io.BytesIO(buf)).to(device)
+        else:
+            with torch.no_grad():
+                teacher_outputs = teacher_model(**inputs)
+            teacher_logits = teacher_outputs.logits
 
-        custom_loss = self.distillation_loss(model, student_outputs.logits, teacher_outputs.logits, inputs, student_outputs.loss)
+        custom_loss = self.distillation_loss(model, student_outputs.logits, teacher_logits, inputs, student_outputs.loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
 
     def distillation_loss(self, model, student_logits, teacher_logits, inputs, original_loss):
@@ -164,7 +196,10 @@ class LogitsTrainer(SFTTrainer):
         return config["distillation"]["alpha"] * loss_kd + (1 - config["distillation"]["alpha"]) * original_loss
 
 # Training arguments
-training_arguments = TrainingArguments(**config["training"])
+training_arguments = TrainingArguments(
+    **config["training"],
+    remove_unused_columns=False,
+)
 
 # Create the custom SFT Trainer
 trainer = LogitsTrainer(
@@ -179,6 +214,7 @@ trainer = LogitsTrainer(
 
 # Add the teacher model to the trainer
 trainer.teacher_model = teacher_model
+trainer.cache_env = cache_env
 
 # Train the model
 trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
