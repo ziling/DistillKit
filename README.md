@@ -112,8 +112,12 @@ To launch DistillKit, use the following command:
 ```bash
 accelerate launch distil_logits.py
 ```
-
 You can replace `distil_logits.py` with whichever script you want to use.
+
+Each training script spawns a separate process for the teacher model. The
+student process sends batches to the teacher via a queue and receives the
+precomputed logits or hidden states. Make sure you have a free GPU (or set the
+teacher to run on CPU inside the script) before launching.
 
 ### Advanced Configurations
 
