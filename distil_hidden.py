@@ -1,12 +1,15 @@
 import os
 import torch
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 from datasets import load_dataset
 from trl import SFTTrainer
-from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, AutoConfig
 from accelerate import Accelerator
 import yaml
 
+# Ensure multiprocessing uses spawn start method
+mp.set_start_method("spawn", force=True)
 # Configuration
 config = {
     "project_name": "distil-multilayer",
@@ -108,7 +111,7 @@ model_kwargs = {"torch_dtype": torch.bfloat16 if config["training"]["bf16"] else
 if config["model_config"]["use_flash_attention"]:
     model_kwargs["attn_implementation"] = "flash_attention_2"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs).to(device)
+teacher_config = AutoConfig.from_pretrained(config["models"]["teacher"])
 student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs).to(device)
 
 class MultiLayerAdaptationLayer(torch.nn.Module):
@@ -137,11 +140,31 @@ class MultiLayerAdaptationLayer(torch.nn.Module):
 
 adaptation_layer = MultiLayerAdaptationLayer(
     student_model.config.hidden_size,
-    teacher_model.config.hidden_size,
+    teacher_config.hidden_size,
     student_model.config.num_hidden_layers,
-    teacher_model.config.num_hidden_layers,
+    teacher_config.num_hidden_layers,
     dtype=torch.bfloat16
 ).to(device)
+
+class TeacherProcess(mp.Process):
+    def __init__(self, model_name, queue_in, queue_out, device="cuda:0"):
+        super().__init__()
+        self.model_name = model_name
+        self.queue_in = queue_in
+        self.queue_out = queue_out
+        self.device = device
+
+    def run(self):
+        model = AutoModelForCausalLM.from_pretrained(self.model_name).to(self.device)
+        model.eval()
+        while True:
+            batch = self.queue_in.get()
+            if batch is None:
+                break
+            batch = {k: torch.tensor(v).to(self.device) for k, v in batch.items()}
+            with torch.no_grad():
+                outputs = model(**batch, output_hidden_states=True)
+            self.queue_out.put([h.cpu() for h in outputs.hidden_states])
 
 class CustomSFTTrainer(SFTTrainer):
     def __init__(self, *args, **kwargs):
@@ -161,16 +184,17 @@ class CustomSFTTrainer(SFTTrainer):
         
         original_loss = student_outputs.loss
 
-        self.teacher_model = self.teacher_model
-        teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
+        teacher_inputs = {
+            "input_ids": inputs["teacher_input_ids"].detach().cpu(),
+            "attention_mask": inputs["teacher_attention_mask"].detach().cpu(),
+        }
+        self.queue_in.put(teacher_inputs)
+        teacher_hidden_states = [t.to(student_outputs.hidden_states[0].device) for t in self.queue_out.get()]
 
-        with torch.no_grad():
-            teacher_inputs = {
-                "input_ids": inputs["teacher_input_ids"],
-                "attention_mask": inputs["teacher_attention_mask"],
-            }
-            
-            teacher_outputs = teacher_model(**teacher_inputs, output_hidden_states=True)
+        class Dummy:
+            pass
+        teacher_outputs = Dummy()
+        teacher_outputs.hidden_states = teacher_hidden_states
 
         custom_loss = self.distillation_loss(student_outputs, teacher_outputs, inputs, original_loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
@@ -214,6 +238,12 @@ training_arguments = TrainingArguments(
     remove_unused_columns=False,
 )
 
+# Set up multiprocessing queues and teacher process
+queue_in = mp.Queue(maxsize=8)
+queue_out = mp.Queue(maxsize=8)
+teacher_process = TeacherProcess(config["models"]["teacher"], queue_in, queue_out)
+teacher_process.start()
+
 # Create the custom SFT Trainer
 trainer = CustomSFTTrainer(
     model=student_model,
@@ -225,10 +255,11 @@ trainer = CustomSFTTrainer(
 )
 
 # Add these attributes to the trainer
-trainer.teacher_model = teacher_model
 trainer.adaptation_layer = adaptation_layer
 trainer.student_tokenizer = student_tokenizer
 trainer.teacher_tokenizer = teacher_tokenizer
+trainer.queue_in = queue_in
+trainer.queue_out = queue_out
 
 # Prepare for distributed training
 trainer = accelerator.prepare(trainer)
@@ -241,3 +272,7 @@ trainer.save_model(config["training"]["output_dir"])
 
 # Save the adaptation layer
 torch.save(adaptation_layer.state_dict(), os.path.join(config["training"]["output_dir"], "adaptation_layer.pth"))
+
+# Shutdown the teacher process
+queue_in.put(None)
+teacher_process.join()

@@ -1,11 +1,14 @@
 import os
 import torch
 import torch.nn.functional as F
+import torch.multiprocessing as mp
 from datasets import load_dataset
 from trl import SFTTrainer, SFTConfig
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments
 import yaml
 
+# Ensure multiprocessing uses spawn start method
+mp.set_start_method("spawn", force=True)
 # Configuration
 config = {
     "project_name": "distil-logits",
@@ -104,7 +107,7 @@ model_kwargs = {"torch_dtype": torch.bfloat16}
 if config["model_config"]["use_flash_attention"]:
     model_kwargs["attn_implementation"] = "flash_attention_2"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs)
+# Load only the student model in the main process
 student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs)
 
 # Optionally freeze layers of the student model based on spectrum configuration
@@ -132,20 +135,41 @@ def pad_logits(student_logits, teacher_logits):
         return (torch.cat([student_logits, pad_tensor], dim=-1), teacher_logits) if student_size < teacher_size else (student_logits, torch.cat([teacher_logits, pad_tensor], dim=-1))
     return student_logits, teacher_logits
 
+class TeacherProcess(mp.Process):
+    def __init__(self, model_name, queue_in, queue_out, device="cuda:0"):
+        super().__init__()
+        self.model_name = model_name
+        self.queue_in = queue_in
+        self.queue_out = queue_out
+        self.device = device
+
+    def run(self):
+        model = AutoModelForCausalLM.from_pretrained(self.model_name).to(self.device)
+        model.eval()
+        while True:
+            batch = self.queue_in.get()
+            if batch is None:
+                break
+            batch = {k: torch.tensor(v).to(self.device) for k, v in batch.items()}
+            with torch.no_grad():
+                outputs = model(**batch)
+            self.queue_out.put(outputs.logits.cpu())
+
 class LogitsTrainer(SFTTrainer):
     def compute_loss(self, model, inputs, return_outputs=False, num_items_in_batch=None):
         device = next(model.parameters()).device
         inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
-        self.teacher_model = self.teacher_model.to(device)
-        
+
         student_model = model.module if hasattr(model, 'module') else model
-        teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
+
+        # Send inputs to teacher process and wait for logits
+        cpu_inputs = {k: v.detach().cpu() for k, v in inputs.items() if k in ["input_ids", "attention_mask"]}
+        self.queue_in.put(cpu_inputs)
+        teacher_logits = self.queue_out.get().to(device)
 
         student_outputs = student_model(**inputs)
-        with torch.no_grad():
-            teacher_outputs = teacher_model(**inputs)
 
-        custom_loss = self.distillation_loss(model, student_outputs.logits, teacher_outputs.logits, inputs, student_outputs.loss)
+        custom_loss = self.distillation_loss(model, student_outputs.logits, teacher_logits, inputs, student_outputs.loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
 
     def distillation_loss(self, model, student_logits, teacher_logits, inputs, original_loss):
@@ -166,22 +190,30 @@ class LogitsTrainer(SFTTrainer):
 # Training arguments
 training_arguments = TrainingArguments(**config["training"])
 
+# Set up multiprocessing queues and teacher process
+queue_in = mp.Queue(maxsize=8)
+queue_out = mp.Queue(maxsize=8)
+teacher_process = TeacherProcess(config["models"]["teacher"], queue_in, queue_out)
+teacher_process.start()
+
 # Create the custom SFT Trainer
 trainer = LogitsTrainer(
     model=student_model,
     train_dataset=tokenized_dataset["train"],
     eval_dataset=tokenized_dataset["test"],
-    #tokenizer=student_tokenizer,
     args=training_arguments,
-    #max_seq_length=config["tokenizer"]["max_length"],
-    #dataset_text_field="text",
 )
 
-# Add the teacher model to the trainer
-trainer.teacher_model = teacher_model
+# Pass the queues to the trainer
+trainer.queue_in = queue_in
+trainer.queue_out = queue_out
 
 # Train the model
 trainer.train(resume_from_checkpoint=config["training"]["resume_from_checkpoint"])
 
 # Save the final model
 trainer.save_model(config["training"]["output_dir"])
+
+# Shutdown the teacher process
+queue_in.put(None)
+teacher_process.join()
