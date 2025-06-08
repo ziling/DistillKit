@@ -131,6 +131,31 @@ We provide sample DeepSpeed configuration files in the `./deepspeed_configs` dir
 
 To use a specific DeepSpeed configuration, you can specify it in your accelerate config.
 
+### Caching Teacher Outputs
+
+Running teacher models can be expensive. DistillKit can read logits or hidden states from a precomputed LMDB cache.
+
+1. Generate the cache using `cache_teacher_outputs.py`:
+
+```bash
+python cache_teacher_outputs.py --dataset <dataset_name> --split train \
+    --teacher <teacher_model> --output teacher_logits.lmdb --mode logits
+# use --mode hidden to cache hidden states
+```
+
+2. In your training configuration, set the cache path:
+
+```python
+config = {
+    # ...
+    "cache": {
+        "teacher_logits": "teacher_logits.lmdb",  # or use teacher_hidden for hidden state caching
+    }
+}
+```
+
+When a cache path is provided, `distil_logits.py` or `distil_hidden.py` will skip teacher inference and load the stored tensors instead.
+
 ## Distillation Methods
 
 DistillKit supports two primary distillation methods:

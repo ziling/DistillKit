@@ -1,4 +1,5 @@
 import os
+import io
 import torch
 import torch.nn.functional as F
 from datasets import load_dataset
@@ -48,6 +49,9 @@ config = {
     },
     "model_config": {
         "use_flash_attention": True
+    },
+    "cache": {
+        "teacher_hidden": None  # Path to LMDB with cached teacher hidden states
     }
 }
 
@@ -71,7 +75,7 @@ student_tokenizer = AutoTokenizer.from_pretrained(config["models"]["student"])
 # Apply chat template to student tokenizer
 student_tokenizer.chat_template = config["tokenizer"]["chat_template"]
 
-def prepare_dataset(example):
+def prepare_dataset(example, idx):
     system = "You are a helpful assistant chatbot."
     conversations = example['conversations']
     
@@ -94,12 +98,25 @@ def prepare_dataset(example):
         "attention_mask": student_encodings["attention_mask"],
         "teacher_input_ids": teacher_encodings["input_ids"],
         "teacher_attention_mask": teacher_encodings["attention_mask"],
+        "id": idx,
     }
 
 # Preprocess and tokenize the dataset
 print("Preprocessing and tokenizing dataset...")
 original_columns = dataset.column_names
-dataset = dataset.map(prepare_dataset, remove_columns=original_columns)
+dataset = dataset.map(
+    prepare_dataset,
+    remove_columns=original_columns,
+    with_indices=True,
+)
+
+# Optional teacher hidden state cache
+cache_env = None
+if config.get("cache", {}).get("teacher_hidden"):
+    import lmdb
+    cache_env = lmdb.open(
+        config["cache"]["teacher_hidden"], readonly=True, lock=False
+    )
 
 print("Dataset preparation complete. Loading models...")
 
@@ -150,6 +167,7 @@ class CustomSFTTrainer(SFTTrainer):
         super(CustomSFTTrainer, self).__init__(*args, **kwargs)
 
     def compute_loss(self, model, inputs, return_outputs=False):
+        sample_id = inputs.pop("id") if "id" in inputs else None
         student_inputs = {
             "input_ids": inputs["input_ids"],
             "attention_mask": inputs["attention_mask"],
@@ -164,13 +182,20 @@ class CustomSFTTrainer(SFTTrainer):
         self.teacher_model = self.teacher_model
         teacher_model = self.teacher_model.module if hasattr(self.teacher_model, 'module') else self.teacher_model
 
-        with torch.no_grad():
-            teacher_inputs = {
-                "input_ids": inputs["teacher_input_ids"],
-                "attention_mask": inputs["teacher_attention_mask"],
-            }
-            
-            teacher_outputs = teacher_model(**teacher_inputs, output_hidden_states=True)
+        if self.cache_env is not None and sample_id is not None:
+            import io, torch as _torch
+            with self.cache_env.begin() as txn:
+                buf = txn.get(str(sample_id.item() if hasattr(sample_id, 'item') else sample_id).encode())
+            teacher_hidden = _torch.load(io.BytesIO(buf))
+            teacher_outputs = type('obj', (object,), {'hidden_states': teacher_hidden})
+        else:
+            with torch.no_grad():
+                teacher_inputs = {
+                    "input_ids": inputs["teacher_input_ids"],
+                    "attention_mask": inputs["teacher_attention_mask"],
+                }
+
+                teacher_outputs = teacher_model(**teacher_inputs, output_hidden_states=True)
 
         custom_loss = self.distillation_loss(student_outputs, teacher_outputs, inputs, original_loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
@@ -229,6 +254,7 @@ trainer.teacher_model = teacher_model
 trainer.adaptation_layer = adaptation_layer
 trainer.student_tokenizer = student_tokenizer
 trainer.teacher_tokenizer = teacher_tokenizer
+trainer.cache_env = cache_env
 
 # Prepare for distributed training
 trainer = accelerator.prepare(trainer)
