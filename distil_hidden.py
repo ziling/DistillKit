@@ -46,6 +46,7 @@ config = {
         "temperature": 2.0,
         "alpha": 0.5
     },
+    "teacher_backend": "transformers",
     "model_config": {
         "use_flash_attention": True
     }
@@ -108,7 +109,11 @@ model_kwargs = {"torch_dtype": torch.bfloat16 if config["training"]["bf16"] else
 if config["model_config"]["use_flash_attention"]:
     model_kwargs["attn_implementation"] = "flash_attention_2"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs).to(device)
+if config.get("teacher_backend") == "vllm":
+    from vllm import LLM
+    teacher_model = LLM(model=config["models"]["teacher"])
+else:
+    teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs).to(device)
 student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs).to(device)
 
 class MultiLayerAdaptationLayer(torch.nn.Module):
@@ -169,8 +174,12 @@ class CustomSFTTrainer(SFTTrainer):
                 "input_ids": inputs["teacher_input_ids"],
                 "attention_mask": inputs["teacher_attention_mask"],
             }
-            
-            teacher_outputs = teacher_model(**teacher_inputs, output_hidden_states=True)
+            if config.get("teacher_backend") == "vllm" and hasattr(teacher_model, "generate"):
+                # Use underlying HF model for hidden states when teacher is vLLM
+                hf_model = teacher_model.get_model() if hasattr(teacher_model, "get_model") else teacher_model.llm_engine.model_runner.model
+                teacher_outputs = hf_model(**teacher_inputs, output_hidden_states=True)
+            else:
+                teacher_outputs = teacher_model(**teacher_inputs, output_hidden_states=True)
 
         custom_loss = self.distillation_loss(student_outputs, teacher_outputs, inputs, original_loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss

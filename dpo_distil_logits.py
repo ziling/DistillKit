@@ -58,6 +58,7 @@ cfg = {
         "kd_temperature": 1.0,
         "kd_weight": 1e-3,
     },
+    "teacher_backend": "transformers",
     "wandb": {
         "entity": "my-team",
         "name": "exp-name",  # run name
@@ -228,7 +229,10 @@ class DPOTrainerWithKD(DPOTrainer):
         """Compute the DPO loss and other metrics for the given batch of inputs for train or test."""
         metrics = {}
 
-        teacher_output, teacher_logits = self.concatenated_forward(self.teacher_model.eval(), batch, no_grad=True)
+        teacher_model = self.teacher_model
+        if cfg.get("teacher_backend") != "vllm":
+            teacher_model = teacher_model.eval()
+        teacher_output, teacher_logits = self.concatenated_forward(teacher_model, batch, no_grad=True)
         model_output, logits = self.concatenated_forward(model, batch)
 
         logit_kd_loss = self.distillation_loss(logits, teacher_logits)
@@ -388,7 +392,27 @@ class DPOTrainerWithKD(DPOTrainer):
 
             if no_grad:
                 with torch.no_grad():
-                    outputs = self.teacher_model(input_ids, **model_kwargs)
+                    if cfg.get("teacher_backend") == "vllm":
+                        from vllm import SamplingParams
+                        seq_lens = attention_mask.sum(dim=1).tolist()
+                        prompts = [tok_student.decode(ids[:l]) for ids, l in zip(input_ids, seq_lens)]
+                        params = SamplingParams(temperature=cfg["dpo"]["kd_temperature"], logprobs=len(tok_student), max_tokens=0)
+                        outs = self.teacher_model.generate(prompts, params)
+                        logits_list = []
+                        for out in outs:
+                            token_probs = out.prompt_logprobs
+                            step_logits = []
+                            for t_dict in token_probs:
+                                logit_vec = torch.full((len(tok_student),), float('-inf'), device=input_ids.device)
+                                for tid, lp in t_dict.items():
+                                    logit_vec[tid] = lp
+                                step_logits.append(logit_vec)
+                            logits_list.append(torch.stack(step_logits))
+                        logits = torch.stack(logits_list)
+                        class O: pass
+                        outputs = O(); outputs.logits = logits
+                    else:
+                        outputs = self.teacher_model(input_ids, **model_kwargs)
             else:
                 outputs = model(input_ids, **model_kwargs)
             logits = outputs.logits
@@ -556,11 +580,14 @@ student_model = AutoModelForCausalLM.from_pretrained(
     cfg["models"]["student"], quantization_config=bnb_cfg
 )
 student_model.config.use_cache = False        # required for gradient-checkpointing
-
-teacher_model = AutoModelForCausalLM.from_pretrained(
-    cfg["models"]["teacher"], quantization_config=bnb_cfg
-)
-teacher_model.eval()                          # we never train the teacher
+if cfg.get("teacher_backend") == "vllm":
+    from vllm import LLM
+    teacher_model = LLM(model=cfg["models"]["teacher"])
+else:
+    teacher_model = AutoModelForCausalLM.from_pretrained(
+        cfg["models"]["teacher"], quantization_config=bnb_cfg
+    )
+    teacher_model.eval()                          # we never train the teacher
 
 
 train_cfg = DPOConfig(

@@ -42,6 +42,7 @@ config = {
         "temperature": 2.0,
         "alpha": 0.5
     },
+    "teacher_backend": "transformers",
     "model_config": {
         "use_flash_attention": True
     }
@@ -104,7 +105,11 @@ model_kwargs = {"torch_dtype": torch.bfloat16}
 if config["model_config"]["use_flash_attention"]:
     model_kwargs["attn_implementation"] = "flash_attention_2"
 
-teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs)
+if config.get("teacher_backend") == "vllm":
+    from vllm import LLM
+    teacher_model = LLM(model=config["models"]["teacher"])
+else:
+    teacher_model = AutoModelForCausalLM.from_pretrained(config["models"]["teacher"], **model_kwargs)
 student_model = AutoModelForCausalLM.from_pretrained(config["models"]["student"], **model_kwargs)
 
 # Optionally freeze layers of the student model based on spectrum configuration
@@ -143,9 +148,28 @@ class LogitsTrainer(SFTTrainer):
 
         student_outputs = student_model(**inputs)
         with torch.no_grad():
-            teacher_outputs = teacher_model(**inputs)
+            if config.get("teacher_backend") == "vllm":
+                from vllm import SamplingParams
+                seq_lens = inputs["attention_mask"].sum(dim=1).tolist()
+                prompts = [teacher_tokenizer.decode(ids[:l]) for ids, l in zip(inputs["input_ids"], seq_lens)]
+                params = SamplingParams(temperature=config["distillation"]["temperature"], logprobs=len(teacher_tokenizer), max_tokens=0)
+                outputs = teacher_model.generate(prompts, params)
+                logits_list = []
+                for out in outputs:
+                    token_probs = out.prompt_logprobs
+                    step_logits = []
+                    for t_dict in token_probs:
+                        logit_vec = torch.full((len(teacher_tokenizer),), float('-inf'))
+                        for tid, lp in t_dict.items():
+                            logit_vec[tid] = lp
+                        step_logits.append(logit_vec)
+                    logits_list.append(torch.stack(step_logits))
+                teacher_logits = torch.stack(logits_list).to(device)
+            else:
+                teacher_outputs = teacher_model(**inputs)
+                teacher_logits = teacher_outputs.logits
 
-        custom_loss = self.distillation_loss(model, student_outputs.logits, teacher_outputs.logits, inputs, student_outputs.loss)
+        custom_loss = self.distillation_loss(model, student_outputs.logits, teacher_logits, inputs, student_outputs.loss)
         return (custom_loss, student_outputs) if return_outputs else custom_loss
 
     def distillation_loss(self, model, student_logits, teacher_logits, inputs, original_loss):
